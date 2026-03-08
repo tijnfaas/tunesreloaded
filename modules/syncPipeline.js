@@ -179,9 +179,14 @@ export function createSyncPipeline({
             }
         }
 
+        // Add to the current playlist — but skip the master playlist (MPL)
+        // because ipod_add_track() already adds every new track to the MPL.
         const idx = appState.currentPlaylistIndex;
         if (idx >= 0 && idx < appState.playlists.length) {
-            wasm.wasmCall('ipod_playlist_add_track', idx, trackIndex);
+            const pl = appState.playlists[idx];
+            if (!pl.is_master) {
+                wasm.wasmCall('ipod_playlist_add_track', idx, trackIndex);
+            }
         }
 
         log?.(`Added: ${meta.title || file.name} (${formatDuration(audioProps.duration)})`, 'success');
