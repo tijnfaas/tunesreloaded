@@ -323,10 +323,12 @@ function writeMhif(view, off, formatId, imageSize) {
 /**
  * Generate ArtworkDB binary + .ithmb files for the given artwork entries.
  *
- * @param {Array<{ dbid: number, imageData: Uint8Array }>} entries
- *   Tracks with artwork. dbid = track database ID, imageData = JPEG/PNG bytes.
+ * Entries can have two forms:
+ *   - { dbid, imageData: Uint8Array }       — JPEG/PNG bytes, will be resized & converted
+ *   - { dbid, preRendered: Map<formatId, Uint8Array> } — existing RGB565 data from a previous ArtworkDB
+ *
+ * @param {Array<{ dbid: number|bigint, imageData?: Uint8Array, preRendered?: Map<number, Uint8Array>, origSize?: number }>} entries
  * @param {Array<{ formatId: number, width: number, height: number, crop?: boolean }>} formats
- *   Artwork formats from parseAlbumArtFormats().
  * @param {Function} [onProgress] - Optional progress callback({ current, total, detail }).
  * @returns {Promise<{ artworkDb: Uint8Array, ithmbs: Map<string, Uint8Array> }>}
  */
@@ -355,21 +357,30 @@ export async function generateArtworkFiles(entries, formats, onProgress) {
         try { onProgress?.({ current: ei + 1, total: entries.length, detail: `Processing artwork ${ei + 1}/${entries.length}` }); } catch (_) {}
 
         for (const f of formats) {
-            try {
-                const rgba = await resizeToRGBA(entry.imageData, f.width, f.height, f.crop);
-                const rgb565 = rgbaToRgb565(rgba, f.width, f.height);
-                const offset = itmbOffsets.get(f.formatId);
-                info.push({ offset, size: rgb565.length });
-                itmbBuffers.get(f.formatId).push(rgb565);
-                itmbOffsets.set(f.formatId, offset + rgb565.length);
-            } catch (e) {
-                // Fallback: zero-filled block
-                const blockSize = f.width * f.height * 2;
-                const offset = itmbOffsets.get(f.formatId);
-                info.push({ offset, size: blockSize });
-                itmbBuffers.get(f.formatId).push(new Uint8Array(blockSize));
-                itmbOffsets.set(f.formatId, offset + blockSize);
+            let rgb565;
+            const expectedSize = f.width * f.height * 2;
+
+            if (entry.preRendered?.has(f.formatId)) {
+                // Use existing RGB565 data (preserved from previous ArtworkDB)
+                const existing = entry.preRendered.get(f.formatId);
+                rgb565 = (existing.length === expectedSize) ? existing : new Uint8Array(expectedSize);
+            } else if (entry.imageData) {
+                // Convert JPEG/PNG to RGB565
+                try {
+                    const rgba = await resizeToRGBA(entry.imageData, f.width, f.height, f.crop);
+                    rgb565 = rgbaToRgb565(rgba, f.width, f.height);
+                } catch (e) {
+                    rgb565 = new Uint8Array(expectedSize);
+                }
+            } else {
+                // No image data available — black placeholder
+                rgb565 = new Uint8Array(expectedSize);
             }
+
+            const offset = itmbOffsets.get(f.formatId);
+            info.push({ offset, size: rgb565.length });
+            itmbBuffers.get(f.formatId).push(rgb565);
+            itmbOffsets.set(f.formatId, offset + rgb565.length);
         }
     }
 
@@ -417,7 +428,8 @@ export async function generateArtworkFiles(entries, formats, onProgress) {
         const entry = entries[ei];
         const imageId = MIN_IMAGE_ID + ei;
 
-        writeMhii(view, pos, imageId, entry.dbid, formats.length, mhiiTotal, entry.imageData.length);
+        const origSize = entry.imageData ? entry.imageData.length : (entry.origSize || 0);
+        writeMhii(view, pos, imageId, entry.dbid, formats.length, mhiiTotal, origSize);
         pos += MHII_SIZE;
 
         for (let fi = 0; fi < formats.length; fi++) {
@@ -526,6 +538,107 @@ export async function debugPreviewIthmb(rgb565Data, width, height, imageIndex = 
     }
 
     return url;
+}
+
+// ─── Existing ArtworkDB Parser ───────────────────────────────────────────────
+
+/**
+ * Parse an existing ArtworkDB binary to extract artwork entries.
+ *
+ * Used to preserve existing artwork when syncing new tracks — we read the
+ * old ArtworkDB, extract per-entry thumbnail offsets/sizes from .ithmb files,
+ * and merge them with new entries before regenerating.
+ *
+ * @param {Uint8Array} dbData — raw ArtworkDB bytes from iPod
+ * @returns {Array<{ dbid: bigint, imageId: number, origSize: number, thumbnails: Array<{ formatId: number, itmbOffset: number, imgSize: number }> }>}
+ */
+export function parseExistingArtworkDb(dbData) {
+    if (!dbData || dbData.length < MHFD_SIZE) return [];
+
+    const view = new DataView(dbData.buffer, dbData.byteOffset, dbData.byteLength);
+    const tag = String.fromCharCode(dbData[0], dbData[1], dbData[2], dbData[3]);
+    if (tag !== 'mhfd') return [];
+
+    const mhfdHeaderLen = view.getUint32(4, true);
+    const numSections = view.getUint32(0x14, true);
+
+    let pos = mhfdHeaderLen;
+    for (let s = 0; s < numSections && pos + 16 <= dbData.length; s++) {
+        const stag = String.fromCharCode(dbData[pos], dbData[pos + 1], dbData[pos + 2], dbData[pos + 3]);
+        if (stag !== 'mhsd') break;
+
+        const mhsdHeaderLen = view.getUint32(pos + 4, true);
+        const mhsdTotalLen = view.getUint32(pos + 8, true);
+        const mhsdType = view.getUint16(pos + 0x0C, true);
+
+        if (mhsdType === 1) {
+            // Image list section
+            const mhliPos = pos + mhsdHeaderLen;
+            if (mhliPos + 12 > dbData.length) break;
+            const ltag = String.fromCharCode(dbData[mhliPos], dbData[mhliPos + 1], dbData[mhliPos + 2], dbData[mhliPos + 3]);
+            if (ltag !== 'mhli') break;
+
+            const mhliHeaderLen = view.getUint32(mhliPos + 4, true);
+            const numImages = view.getUint32(mhliPos + 8, true);
+
+            const entries = [];
+            let imgPos = mhliPos + mhliHeaderLen;
+
+            for (let i = 0; i < numImages && imgPos + 0x34 <= dbData.length; i++) {
+                const itag = String.fromCharCode(dbData[imgPos], dbData[imgPos + 1], dbData[imgPos + 2], dbData[imgPos + 3]);
+                if (itag !== 'mhii') break;
+
+                const mhiiHeaderLen = view.getUint32(imgPos + 4, true);
+                const mhiiTotalLen = view.getUint32(imgPos + 8, true);
+                const numChildren = view.getUint32(imgPos + 0x0C, true);
+                const imageId = view.getUint32(imgPos + 0x10, true);
+                const dbid = view.getBigUint64(imgPos + 0x14, true);
+                const origSize = view.getUint32(imgPos + 0x30, true);
+
+                // Walk children to find mhni entries (thumbnail/format info)
+                const thumbnails = [];
+                let childPos = imgPos + mhiiHeaderLen;
+                const childEnd = imgPos + mhiiTotalLen;
+
+                for (let c = 0; c < numChildren && childPos + 12 <= childEnd; c++) {
+                    const ctag = String.fromCharCode(dbData[childPos], dbData[childPos + 1], dbData[childPos + 2], dbData[childPos + 3]);
+                    if (ctag !== 'mhod') {
+                        const cTotalLen = view.getUint32(childPos + 8, true);
+                        childPos += cTotalLen || 1;
+                        continue;
+                    }
+
+                    const mhodTotalLen = view.getUint32(childPos + 8, true);
+                    const mhodType = view.getUint16(childPos + 0x0C, true);
+
+                    if (mhodType === 2) {
+                        // Container wrapping mhni
+                        const mhniPos = childPos + MHOD_CONTAINER_SIZE;
+                        if (mhniPos + MHNI_SIZE <= dbData.length) {
+                            const ntag = String.fromCharCode(dbData[mhniPos], dbData[mhniPos + 1], dbData[mhniPos + 2], dbData[mhniPos + 3]);
+                            if (ntag === 'mhni') {
+                                const formatId = view.getUint32(mhniPos + 0x10, true);
+                                const itmbOffset = view.getUint32(mhniPos + 0x14, true);
+                                const imgSize = view.getUint32(mhniPos + 0x18, true);
+                                thumbnails.push({ formatId, itmbOffset, imgSize });
+                            }
+                        }
+                    }
+
+                    childPos += mhodTotalLen;
+                }
+
+                entries.push({ dbid, imageId, thumbnails, origSize });
+                imgPos += mhiiTotalLen;
+            }
+
+            return entries;
+        }
+
+        pos += mhsdTotalLen;
+    }
+
+    return [];
 }
 
 // ─── iTunesDB Binary Patching ───────────────────────────────────────────────

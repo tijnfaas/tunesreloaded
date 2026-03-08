@@ -1,4 +1,4 @@
-import { parseAlbumArtFormats, generateArtworkFiles, patchITunesDbArtwork, lookupFormatSpecs, debugPreviewIthmb, extractExactDbids } from './artworkWriter.js';
+import { parseAlbumArtFormats, generateArtworkFiles, patchITunesDbArtwork, lookupFormatSpecs, debugPreviewIthmb, extractExactDbids, parseExistingArtworkDb } from './artworkWriter.js';
 import { recomputeHash58, parseUUID } from './hashAB.js';
 
 export function createSyncPipeline({
@@ -412,9 +412,47 @@ export function createSyncPipeline({
         }
 
         // 2c) Generate and write ArtworkDB + .ithmb files (pure JS, bypasses WASM)
+        //
+        // IMPORTANT: We must merge NEW artwork entries with EXISTING entries already
+        // on the iPod. Otherwise, syncing a single new track would overwrite the
+        // ArtworkDB and erase artwork for all previously synced tracks.
         if (artworkEntries.length > 0) {
             try {
                 setUploadModalState({ status: 'Generating artwork...', detail: '' });
+
+                // ── Read existing artwork from iPod ──────────────────────────
+                let existingArtworkEntries = [];
+                try {
+                    const { artworkDb: existingDb, ithmbs: existingIthmbs } = await fsSync.readArtworkFromIpod(appState.ipodHandle);
+                    if (existingDb && existingDb.length > 0) {
+                        const parsed = parseExistingArtworkDb(existingDb);
+                        for (const entry of parsed) {
+                            const preRendered = new Map();
+                            for (const thumb of entry.thumbnails) {
+                                const filename = `F${thumb.formatId}_1.ithmb`;
+                                const itmbData = existingIthmbs.get(filename);
+                                if (itmbData && thumb.itmbOffset + thumb.imgSize <= itmbData.length) {
+                                    preRendered.set(
+                                        thumb.formatId,
+                                        itmbData.slice(thumb.itmbOffset, thumb.itmbOffset + thumb.imgSize),
+                                    );
+                                }
+                            }
+                            if (preRendered.size > 0) {
+                                existingArtworkEntries.push({
+                                    dbid: entry.dbid,       // BigInt (exact)
+                                    preRendered,
+                                    origSize: entry.origSize,
+                                });
+                            }
+                        }
+                        log?.(`Found ${existingArtworkEntries.length} existing artwork entry/ies on iPod`, 'info');
+                    }
+                } catch (e) {
+                    log?.(`Could not read existing artwork: ${e?.message || e}`, 'warning');
+                }
+
+                // ── Determine artwork formats ────────────────────────────────
 
                 // Tier 1: SysInfoExtended from MEMFS or iPod
                 let plistXml = fsSync.readSysInfoExtendedFromVFS();
@@ -473,12 +511,12 @@ export function createSyncPipeline({
                 }
 
                 if (formats.length > 0) {
-                    // ── Fix dbid precision ──────────────────────────────────────
+                    // ── Fix dbid precision for NEW entries ────────────────────
                     // JavaScript Numbers (64-bit double) can only represent integers
                     // up to 2^53 exactly. iPod dbids are random 64-bit values, so
                     // JSON.parse rounds them. We read the exact BigInt values from
                     // the iTunesDB binary before generating ArtworkDB.
-                    const numberDbids = artworkEntries.map(ae => ae.dbid); // save imprecise Numbers for iTunesDB patching
+                    const newNumberDbids = artworkEntries.map(ae => ae.dbid);
                     try {
                         const FS = wasm.getModule().FS;
                         const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
@@ -486,7 +524,7 @@ export function createSyncPipeline({
                         const dbSnapshot = new Uint8Array(rawData.length);
                         dbSnapshot.set(rawData);
 
-                        const exactDbids = extractExactDbids(dbSnapshot, numberDbids);
+                        const exactDbids = extractExactDbids(dbSnapshot, newNumberDbids);
                         if (exactDbids.size > 0) {
                             for (const ae of artworkEntries) {
                                 const exact = exactDbids.get(ae.dbid);
@@ -501,47 +539,41 @@ export function createSyncPipeline({
                         log?.(`dbid precision fix failed (artwork may not link): ${e?.message || e}`, 'warning');
                     }
 
-                    log?.(`Generating artwork for ${artworkEntries.length} track(s) in ${formats.length} format(s)...`, 'info');
-                    const { artworkDb, ithmbs } = await generateArtworkFiles(artworkEntries, formats, ({ current, total, detail }) => {
+                    // ── Merge existing + new artwork entries ──────────────────
+                    // New entries override existing ones with the same dbid (user may
+                    // be updating artwork). Existing entries for other tracks are kept.
+                    const newDbidSet = new Set(artworkEntries.map(ae =>
+                        typeof ae.dbid === 'bigint' ? ae.dbid : BigInt(ae.dbid)));
+                    const keptExisting = existingArtworkEntries.filter(e => !newDbidSet.has(e.dbid));
+                    const mergedEntries = [...keptExisting, ...artworkEntries];
+
+                    log?.(`Artwork merge: ${keptExisting.length} existing + ${artworkEntries.length} new = ${mergedEntries.length} total`, 'info');
+                    log?.(`Generating artwork for ${mergedEntries.length} track(s) in ${formats.length} format(s)...`, 'info');
+
+                    const { artworkDb, ithmbs } = await generateArtworkFiles(mergedEntries, formats, ({ current, total, detail }) => {
                         setUploadModalState({ status: 'Generating artwork...', detail: detail || `${current}/${total}` });
                     });
 
                     if (artworkDb.length > 0) {
-                        // ── Verify ArtworkDB song_id bytes ──
-                        // Dump the mhii song_id (offset 0x14 from mhii start) to verify
-                        // that the BigInt dbid was written correctly.
-                        try {
-                            const MHFD = 0x84, MHSD = 0x60, MHLI = 0x5C;
-                            const mhiiStart = MHFD + MHSD + MHLI;
-                            if (artworkDb.length >= mhiiStart + 0x1C) {
-                                const songIdBytes = Array.from(artworkDb.slice(mhiiStart + 0x14, mhiiStart + 0x1C))
-                                    .map(b => b.toString(16).padStart(2, '0')).join(' ');
-                                const artDbView = new DataView(artworkDb.buffer, artworkDb.byteOffset, artworkDb.byteLength);
-                                const songIdBig = artDbView.getBigUint64(mhiiStart + 0x14, true);
-                                console.log(`[ArtworkVerify] ArtworkDB mhii song_id: 0x${songIdBig.toString(16)} bytes=[${songIdBytes}]`);
-                                // Compare with what we intended
-                                const intended = artworkEntries[0]?.dbid;
-                                const match = (typeof intended === 'bigint') ? (songIdBig === intended) : (songIdBig === BigInt(intended));
-                                console.log(`[ArtworkVerify] Intended dbid: 0x${intended?.toString(16)} — ${match ? '✓ MATCH' : '✗ MISMATCH!'}`);
-                            }
-                        } catch (e) {
-                            console.warn('[ArtworkVerify] Verification failed:', e);
-                        }
-
                         setUploadModalState({ status: 'Writing artwork to iPod...', detail: '' });
                         await fsSync.writeArtworkFiles(appState.ipodHandle, artworkDb, ithmbs);
                         log?.(`Wrote artwork: ArtworkDB + ${ithmbs.size} .ithmb file(s)`, 'success');
 
                         // Patch iTunesDB in MEMFS: set has_artwork / artwork_count / artwork_size
+                        // Use the COMBINED set of dbids (existing + new) so that all
+                        // tracks with artwork get their has_artwork flag set correctly.
                         try {
                             const FS = wasm.getModule().FS;
                             const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
-                            // Use saved Number dbids (not the BigInt-fixed ones) for iTunesDB patching,
-                            // because patchITunesDbArtwork reads dbids as Numbers too.
-                            const artworkDbids = new Set(numberDbids);
+                            // Build Number-based dbid set for patchITunesDbArtwork
+                            // (it reads dbids from iTunesDB as Numbers for comparison).
+                            const allArtworkDbids = new Set();
+                            for (const e of mergedEntries) {
+                                allArtworkDbids.add(typeof e.dbid === 'bigint' ? Number(e.dbid) : e.dbid);
+                            }
                             const ithmbSizePerTrack = formats.reduce((sum, f) => sum + f.width * f.height * 2, 0);
 
-                            console.log(`[ArtworkDiag] Patching iTunesDB: ${artworkEntries.length} artwork entry/ies, numberDbids=[${numberDbids.map(d => '0x' + d.toString(16)).join(', ')}]`);
+                            console.log(`[ArtworkDiag] Patching iTunesDB: ${mergedEntries.length} merged entry/ies (${keptExisting.length} existing + ${artworkEntries.length} new)`);
 
                             // CRITICAL: FS.readFile may return the internal MEMFS buffer.
                             // We must copy it to our own ArrayBuffer before modifying,
@@ -550,7 +582,7 @@ export function createSyncPipeline({
                             const dbData = new Uint8Array(rawData.length);
                             dbData.set(rawData);
 
-                            const { patched } = patchITunesDbArtwork(dbData, artworkDbids, formats.length, ithmbSizePerTrack);
+                            const { patched } = patchITunesDbArtwork(dbData, allArtworkDbids, formats.length, ithmbSizePerTrack);
                             if (patched > 0) {
                                 // Re-sign after artwork patch (our binary edit invalidated the checksum)
                                 const scheme = dbData[0x30] | (dbData[0x31] << 8);

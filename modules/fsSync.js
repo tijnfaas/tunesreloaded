@@ -605,6 +605,40 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
     }
 
     /**
+     * Read existing ArtworkDB + .ithmb files from the iPod.
+     * Used to preserve existing artwork when syncing new tracks.
+     *
+     * @param {FileSystemDirectoryHandle} ipodHandle
+     * @returns {Promise<{ artworkDb: Uint8Array|null, ithmbs: Map<string, Uint8Array> }>}
+     */
+    async function readArtworkFromIpod(ipodHandle) {
+        if (!ipodHandle) return { artworkDb: null, ithmbs: new Map() };
+        try {
+            const ctrl = await ipodHandle.getDirectoryHandle('iPod_Control', { create: false });
+            const artDir = await ctrl.getDirectoryHandle('Artwork', { create: false });
+
+            let artworkDb = null;
+            const ithmbs = new Map();
+
+            for await (const [name, handle] of artDir.entries()) {
+                if (handle.kind !== 'file') continue;
+
+                if (name === 'ArtworkDB') {
+                    const file = await handle.getFile();
+                    artworkDb = new Uint8Array(await file.arrayBuffer());
+                } else if (/^F\d+_\d+\.ithmb$/i.test(name)) {
+                    const file = await handle.getFile();
+                    ithmbs.set(name, new Uint8Array(await file.arrayBuffer()));
+                }
+            }
+
+            return { artworkDb, ithmbs };
+        } catch (_) {
+            return { artworkDb: null, ithmbs: new Map() };
+        }
+    }
+
+    /**
      * Read the SysInfoExtended plist from MEMFS (if available).
      * Returns the XML string or null.
      */
@@ -628,6 +662,7 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
         deleteFileFromIpodRelativePath,
         reSignDatabaseFiles,
         writeArtworkFiles,
+        readArtworkFromIpod,
         readSysInfoExtendedFromVFS,
         scanExistingIthmbs,
     };
