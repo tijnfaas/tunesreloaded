@@ -249,7 +249,7 @@ function gcd(a, b) {
 }
 
 function lcm(a, b) {
-    return (a === 0 || b === 0) ? 1 : Math.floor((a * b) / gcd(a, b));
+    return (a === 0 || b === 0) ? 0 : Math.floor((a * b) / gcd(a, b));
 }
 
 /**

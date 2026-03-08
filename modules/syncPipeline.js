@@ -1,5 +1,7 @@
 import { parseAlbumArtFormats, generateArtworkFiles, patchITunesDbArtwork, lookupFormatSpecs, debugPreviewIthmb, extractExactDbids, parseExistingArtworkDb } from './artworkWriter.js';
-import { recomputeHash58, parseUUID } from './hashAB.js';
+// import { recomputeHash58, parseUUID } from './hashAB.js';
+// ↑ Disabled: JS hash58 doesn't match libgpod's; using libgpod's hash as-is
+// import { rebuildIndexSections } from './indexBuilder.js';  // disabled: see note in saveDatabase
 
 export function createSyncPipeline({
     appState,
@@ -329,6 +331,16 @@ export function createSyncPipeline({
             const trackCount = wasm.wasmCall('ipod_get_track_count');
             log?.(`Syncing iPod database... (${trackCount} tracks in memory)`, 'info');
             console.log(`[SyncDiag] Track count before ipod_write_db: ${trackCount}`);
+
+            // ── MPL member count BEFORE ipod_write_db ──
+            // ipod_write_db() validates playlists and may remove members.
+            // Compare before/after to detect if validation is removing tracks.
+            const plsBefore = wasm.wasmGetJson('ipod_get_all_playlists_json');
+            const mplBefore = plsBefore?.find(p => p.is_master);
+            console.log(`[SyncDiag] MPL member count BEFORE ipod_write_db: ${mplBefore?.track_count ?? '?'} (track list: ${trackCount})`);
+            if (mplBefore && mplBefore.track_count !== trackCount) {
+                log?.(`⚠ MPL/track mismatch BEFORE write: MPL=${mplBefore.track_count}, tracks=${trackCount}`, 'warning');
+            }
         }
         setUploadModalState({ status: 'Preparing database...', detail: '' });
         const result = wasm.wasmCallWithError('ipod_write_db');
@@ -343,61 +355,101 @@ export function createSyncPipeline({
             return;
         }
 
-        // Verify: count tracks in the MEMFS iTunesDB that was just written
+        // ── MPL member count AFTER ipod_write_db ──
+        {
+            const trackCountAfter = wasm.wasmCall('ipod_get_track_count');
+            const plsAfter = wasm.wasmGetJson('ipod_get_all_playlists_json');
+            const mplAfter = plsAfter?.find(p => p.is_master);
+            console.log(`[SyncDiag] MPL member count AFTER ipod_write_db: ${mplAfter?.track_count ?? '?'} (track list: ${trackCountAfter})`);
+            if (mplAfter && mplAfter.track_count !== trackCountAfter) {
+                log?.(`⚠ MPL/track MISMATCH after write: MPL=${mplAfter.track_count}, tracks=${trackCountAfter}`, 'warning');
+            }
+        }
+
+        // Verify: parse the MEMFS iTunesDB binary — enumerate ALL mhsd sections
         try {
             const FS = wasm.getModule().FS;
             const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
             const written = FS.readFile(dbPath);
             const wView = new DataView(written.buffer, written.byteOffset, written.byteLength);
-            // mhbd → skip to mhsd type=1 → mhlt → numTracks
+            let diskTrackCount = 0;
             if (written.length > 0x20) {
                 const mhbdHL = wView.getUint32(4, true);
+                const dbVersion = wView.getUint32(0x10, true);
+                const numChildren = wView.getUint32(0x14, true);
+                const dbIdHex = Array.from(written.slice(0x18, 0x20)).map(b => b.toString(16).padStart(2, '0')).join('');
+                const hashScheme = wView.getUint16(0x30, true);
+                log?.(`mhbd: hdr=${mhbdHL}, version=${dbVersion}, children=${numChildren}, db_id=0x${dbIdHex}, scheme=${hashScheme}`, 'info');
+
+                // Walk ALL mhsd sections
                 let p = mhbdHL;
-                const nMhsd = wView.getUint32(0x10, true);
-                for (let i = 0; i < nMhsd && p + 16 <= written.length; i++) {
-                    const sType = wView.getUint32(p + 0x0C, true);
+                let sectionsFound = 0;
+                for (let i = 0; i < numChildren && p + 16 <= written.length; i++) {
+                    const tag = String.fromCharCode(written[p], written[p+1], written[p+2], written[p+3]);
+                    if (tag !== 'mhsd') break;
                     const sHL = wView.getUint32(p + 4, true);
                     const sTL = wView.getUint32(p + 8, true);
-                    if (sType === 1) {
-                        const mhltP = p + sHL;
-                        const nTracks = wView.getUint32(mhltP + 8, true);
-                        log?.(`iTunesDB written: ${nTracks} tracks, ${written.length} bytes`, 'info');
-                        console.log(`[SyncDiag] iTunesDB on disk: ${nTracks} tracks, ${written.length} bytes`);
-                        break;
+                    const sType = wView.getUint32(p + 0x0C, true);
+                    sectionsFound++;
+
+                    // Peek at the child header inside this mhsd
+                    const childP = p + sHL;
+                    let childInfo = '';
+                    if (childP + 12 <= written.length) {
+                        const childTag = String.fromCharCode(written[childP], written[childP+1], written[childP+2], written[childP+3]);
+                        const childHL = wView.getUint32(childP + 4, true);
+                        const childCount = wView.getUint32(childP + 8, true);
+                        childInfo = ` → ${childTag} (count=${childCount})`;
+
+                        if (sType === 1 && childTag === 'mhlt') {
+                            diskTrackCount = childCount;
+                        }
+
+                        // For playlist sections: peek at the first playlist (MPL)
+                        if (childTag === 'mhlp' && childCount > 0) {
+                            const firstPlP = childP + childHL;
+                            if (firstPlP + 24 <= written.length) {
+                                const plTag = String.fromCharCode(written[firstPlP], written[firstPlP+1], written[firstPlP+2], written[firstPlP+3]);
+                                if (plTag === 'mhyp') {
+                                    const plMembers = wView.getUint32(firstPlP + 16, true);
+                                    const plFlag = wView.getUint8(firstPlP + 20);
+                                    childInfo += `, MPL: ${plMembers} members (flag=${plFlag})`;
+                                }
+                            }
+                        }
                     }
+
+                    log?.(`  mhsd #${i}: type=${sType}, size=${sTL}${childInfo}`, 'info');
                     p += sTL;
                 }
+                log?.(`iTunesDB: ${diskTrackCount} tracks, ${written.length} bytes, ${sectionsFound}/${numChildren} sections`, 'info');
+
+                // Log libgpod's hash58 for reference (no longer overridden by JS)
+                if (hashScheme === 1 && written.length > 0x6C) {
+                    const libgpodHash = Array.from(written.slice(0x58, 0x6C))
+                        .map(b => b.toString(16).padStart(2, '0')).join('');
+                    log?.(`libgpod hash58: ${libgpodHash} (will be preserved as-is)`, 'info');
+                }
+            }
+
+            // List all files libgpod generated and clean stale ones
+            const itunesDir = `${fsSync.mountpoint}/iPod_Control/iTunes`;
+            const files = FS.readdir(itunesDir).filter(n => n !== '.' && n !== '..');
+            log?.(`MEMFS files after write: ${files.join(', ')}`, 'info');
+
+            // itdb_write() renames "Play Counts" → "Play Counts.bak".
+            // Remove it immediately so it doesn't confuse a later ipod_parse_db().
+            for (const stale of ['Play Counts', 'Play Counts.bak', 'OTGPlaylistInfo']) {
+                try { FS.unlink(`${itunesDir}/${stale}`); } catch (_) {}
             }
         } catch (e) {
             console.warn('[SyncDiag] Could not verify iTunesDB:', e);
         }
 
-        // 2b) Re-sign databases after ipod_write_db().
-        //     libgpod's WASM build may produce incorrect checksums, so we
-        //     always recompute them with our own verified implementations.
+        // 2b) Re-sign hashAB databases (Nano 6G/7G only).
+        //     Hash58 (Nano 3G/4G, Classic) is handled in step 2d below,
+        //     AFTER all database modifications (artwork patch etc.) are done.
         {
-            // Hash58 (Checksum Type 1) — Nano 3G/4G, Classic 6G/7G
-            // Without correct HMAC-SHA1, the iPod silently rejects the database
-            // and keeps the previous version (causing "ghost" tracks after deletion).
-            try {
-                const FS = wasm.getModule().FS;
-                const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
-                const rawData = FS.readFile(dbPath);
-                const dbData = new Uint8Array(rawData.length);
-                dbData.set(rawData);
-                const scheme = dbData.length > 0x32 ? (dbData[0x30] | (dbData[0x31] << 8)) : 0;
-                if (scheme === 1) {
-                    const fwGuid = firewireSetup?.getFirewireGuidHex();
-                    if (fwGuid) {
-                        await recomputeHash58(dbData, parseUUID(fwGuid));
-                        FS.writeFile(dbPath, dbData);
-                        log?.('Recomputed iTunesDB hash58', 'info');
-                    }
-                }
-            } catch (e) {
-                log?.(`hash58 recomputation failed: ${e?.message || e}`, 'warning');
-            }
-
             // hashAB — Nano 6G/7G (iTunesCDB + Locations.itdb.cbk)
             if (firewireSetup?.needsHashAB?.()) {
                 const fwGuid = firewireSetup.getFirewireGuidHex();
@@ -416,7 +468,8 @@ export function createSyncPipeline({
         // IMPORTANT: We must merge NEW artwork entries with EXISTING entries already
         // on the iPod. Otherwise, syncing a single new track would overwrite the
         // ArtworkDB and erase artwork for all previously synced tracks.
-        if (artworkEntries.length > 0) {
+        const hasPendingDeletes = (appState.pendingFileDeletes?.length || 0) > 0;
+        if (artworkEntries.length > 0 || hasPendingDeletes) {
             try {
                 setUploadModalState({ status: 'Generating artwork...', detail: '' });
 
@@ -511,42 +564,89 @@ export function createSyncPipeline({
                 }
 
                 if (formats.length > 0) {
-                    // ── Fix dbid precision for NEW entries ────────────────────
-                    // JavaScript Numbers (64-bit double) can only represent integers
-                    // up to 2^53 exactly. iPod dbids are random 64-bit values, so
-                    // JSON.parse rounds them. We read the exact BigInt values from
-                    // the iTunesDB binary before generating ArtworkDB.
-                    const newNumberDbids = artworkEntries.map(ae => ae.dbid);
+                    // ── Extract current track dbids (exact BigInts) ───────────
+                    // Read the iTunesDB binary to get exact 64-bit dbids for all
+                    // current tracks. Used for: (1) fixing precision of new entries,
+                    // (2) filtering out artwork for deleted tracks.
+                    let currentTrackDbids = new Set(); // Set<BigInt>
+                    let dbSnapshot = null;
                     try {
                         const FS = wasm.getModule().FS;
                         const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
                         const rawData = FS.readFile(dbPath);
-                        const dbSnapshot = new Uint8Array(rawData.length);
+                        dbSnapshot = new Uint8Array(rawData.length);
                         dbSnapshot.set(rawData);
 
-                        const exactDbids = extractExactDbids(dbSnapshot, newNumberDbids);
-                        if (exactDbids.size > 0) {
-                            for (const ae of artworkEntries) {
-                                const exact = exactDbids.get(ae.dbid);
-                                if (exact !== undefined) {
-                                    log?.(`dbid fix: ${ae.dbid} (0x${ae.dbid.toString(16)}) → 0x${exact.toString(16)}`, 'info');
-                                    ae.dbid = exact; // Replace imprecise Number with exact BigInt
+                        // Walk mhlt to extract all track dbids as BigInts
+                        const sv = new DataView(dbSnapshot.buffer, dbSnapshot.byteOffset, dbSnapshot.byteLength);
+                        const mhbdHL = sv.getUint32(4, true);
+                        const numCh = sv.getUint32(0x14, true);
+                        let sp = mhbdHL;
+                        for (let si = 0; si < numCh && sp + 16 <= dbSnapshot.length; si++) {
+                            const st = String.fromCharCode(dbSnapshot[sp], dbSnapshot[sp+1], dbSnapshot[sp+2], dbSnapshot[sp+3]);
+                            if (st !== 'mhsd') break;
+                            const sType = sv.getUint32(sp + 0x0C, true);
+                            const sHL = sv.getUint32(sp + 4, true);
+                            const sTL = sv.getUint32(sp + 8, true);
+                            if (sType === 1) {
+                                const mhltP = sp + sHL;
+                                const mhltHL = sv.getUint32(mhltP + 4, true);
+                                const nTracks = sv.getUint32(mhltP + 8, true);
+                                let tp = mhltP + mhltHL;
+                                for (let t = 0; t < nTracks && tp + 4 <= dbSnapshot.length; t++) {
+                                    const tt = String.fromCharCode(dbSnapshot[tp], dbSnapshot[tp+1], dbSnapshot[tp+2], dbSnapshot[tp+3]);
+                                    if (tt !== 'mhit') break;
+                                    const mhitHL = sv.getUint32(tp + 4, true);
+                                    const mhitTL = sv.getUint32(tp + 8, true);
+                                    if (mhitHL > 0x78) {
+                                        currentTrackDbids.add(sv.getBigUint64(tp + 0x70, true));
+                                    }
+                                    tp += mhitTL;
                                 }
+                                break;
                             }
-                            log?.(`Fixed ${exactDbids.size} dbid(s) with exact 64-bit values from iTunesDB`, 'info');
+                            sp += sTL;
                         }
+                        log?.(`Extracted ${currentTrackDbids.size} current track dbid(s) from iTunesDB`, 'info');
                     } catch (e) {
-                        log?.(`dbid precision fix failed (artwork may not link): ${e?.message || e}`, 'warning');
+                        log?.(`Could not extract current dbids: ${e?.message || e}`, 'warning');
+                    }
+
+                    // ── Fix dbid precision for NEW entries ────────────────────
+                    if (artworkEntries.length > 0 && dbSnapshot) {
+                        const newNumberDbids = artworkEntries.map(ae => ae.dbid);
+                        try {
+                            const exactDbids = extractExactDbids(dbSnapshot, newNumberDbids);
+                            if (exactDbids.size > 0) {
+                                for (const ae of artworkEntries) {
+                                    const exact = exactDbids.get(ae.dbid);
+                                    if (exact !== undefined) {
+                                        log?.(`dbid fix: ${ae.dbid} (0x${ae.dbid.toString(16)}) → 0x${exact.toString(16)}`, 'info');
+                                        ae.dbid = exact;
+                                    }
+                                }
+                                log?.(`Fixed ${exactDbids.size} dbid(s) with exact 64-bit values from iTunesDB`, 'info');
+                            }
+                        } catch (e) {
+                            log?.(`dbid precision fix failed (artwork may not link): ${e?.message || e}`, 'warning');
+                        }
                     }
 
                     // ── Merge existing + new artwork entries ──────────────────
-                    // New entries override existing ones with the same dbid (user may
-                    // be updating artwork). Existing entries for other tracks are kept.
+                    // 1. New entries override existing ones with same dbid
+                    // 2. Existing entries for DELETED tracks are removed (orphan cleanup)
+                    // 3. Remaining existing entries are kept
                     const newDbidSet = new Set(artworkEntries.map(ae =>
                         typeof ae.dbid === 'bigint' ? ae.dbid : BigInt(ae.dbid)));
-                    const keptExisting = existingArtworkEntries.filter(e => !newDbidSet.has(e.dbid));
+                    const beforeFilter = existingArtworkEntries.length;
+                    const keptExisting = existingArtworkEntries.filter(e =>
+                        !newDbidSet.has(e.dbid) &&
+                        (currentTrackDbids.size === 0 || currentTrackDbids.has(e.dbid)));
                     const mergedEntries = [...keptExisting, ...artworkEntries];
-
+                    const removedCount = beforeFilter - keptExisting.length;
+                    if (removedCount > 0) {
+                        log?.(`Artwork cleanup: removed ${removedCount} entry/ies (overridden or orphaned from deleted tracks)`, 'info');
+                    }
                     log?.(`Artwork merge: ${keptExisting.length} existing + ${artworkEntries.length} new = ${mergedEntries.length} total`, 'info');
                     log?.(`Generating artwork for ${mergedEntries.length} track(s) in ${formats.length} format(s)...`, 'info');
 
@@ -559,53 +659,75 @@ export function createSyncPipeline({
                         await fsSync.writeArtworkFiles(appState.ipodHandle, artworkDb, ithmbs);
                         log?.(`Wrote artwork: ArtworkDB + ${ithmbs.size} .ithmb file(s)`, 'success');
 
-                        // Patch iTunesDB in MEMFS: set has_artwork / artwork_count / artwork_size
-                        // Use the COMBINED set of dbids (existing + new) so that all
-                        // tracks with artwork get their has_artwork flag set correctly.
-                        try {
-                            const FS = wasm.getModule().FS;
-                            const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
-                            // Build Number-based dbid set for patchITunesDbArtwork
-                            // (it reads dbids from iTunesDB as Numbers for comparison).
-                            const allArtworkDbids = new Set();
-                            for (const e of mergedEntries) {
-                                allArtworkDbids.add(typeof e.dbid === 'bigint' ? Number(e.dbid) : e.dbid);
-                            }
-                            const ithmbSizePerTrack = formats.reduce((sum, f) => sum + f.width * f.height * 2, 0);
-
-                            console.log(`[ArtworkDiag] Patching iTunesDB: ${mergedEntries.length} merged entry/ies (${keptExisting.length} existing + ${artworkEntries.length} new)`);
-
-                            // CRITICAL: FS.readFile may return the internal MEMFS buffer.
-                            // We must copy it to our own ArrayBuffer before modifying,
-                            // otherwise FS.writeFile triggers a use-after-free.
-                            const rawData = FS.readFile(dbPath);
-                            const dbData = new Uint8Array(rawData.length);
-                            dbData.set(rawData);
-
-                            const { patched } = patchITunesDbArtwork(dbData, allArtworkDbids, formats.length, ithmbSizePerTrack);
-                            if (patched > 0) {
-                                // Re-sign after artwork patch (our binary edit invalidated the checksum)
-                                const scheme = dbData[0x30] | (dbData[0x31] << 8);
-                                if (scheme === 1) {
-                                    const fwGuid = firewireSetup?.getFirewireGuidHex();
-                                    if (fwGuid) {
-                                        await recomputeHash58(dbData, parseUUID(fwGuid));
-                                        log?.('Re-signed iTunesDB hash58 after artwork patch', 'info');
-                                    }
-                                }
-
-                                FS.writeFile(dbPath, dbData);
-                                log?.(`Patched iTunesDB: ${patched} track(s) marked with artwork`, 'info');
-                            } else {
-                                log?.('iTunesDB patch: no matching tracks found (dbid mismatch?)', 'warning');
-                            }
-                        } catch (e) {
-                            log?.(`iTunesDB artwork patch failed: ${e?.message || e}`, 'warning');
-                        }
+                        // ── DISABLED: iTunesDB artwork patching ──────────────
+                        // Patching has_artwork / artwork_count / artwork_size in
+                        // MHIT records modifies the database binary AFTER libgpod's
+                        // itdb_write(), which invalidates libgpod's hash58.  Our JS
+                        // hash58 recomputation does not match libgpod's, so the iPod
+                        // rejects the modified database.  Skipping this keeps
+                        // libgpod's hash58 intact.  Artwork in ArtworkDB/ithmb is
+                        // still written (separate files); tracks just won't display
+                        // cover art until we fix hash58 or expose libgpod's hash
+                        // function via WASM.
+                        log?.(`Artwork files written; iTunesDB artwork flags NOT patched (preserving libgpod hash58)`, 'info');
                     }
                 }
             } catch (e) {
                 log?.(`Artwork generation failed: ${e?.message || e}`, 'warning');
+            }
+        }
+
+        // 2d) Use libgpod's hash58 AS-IS — no modifications to iTunesDB.
+        //
+        //     Our JavaScript recomputeHash58() produces a DIFFERENT HMAC-SHA1
+        //     than libgpod's C code (confirmed by diagnostic: neither BE nor LE
+        //     byte order for FWID matches).  ANY modification to the database
+        //     after itdb_write() (db_id randomization, artwork patching, hash58
+        //     recomputation) invalidates the correct hash that libgpod wrote.
+        //
+        //     Strategy: ship libgpod's database UNMODIFIED.  The iPod will
+        //     accept it because the hash matches.  Artwork flags won't be set
+        //     in iTunesDB (cover art won't display), but tracks WILL appear
+        //     with correct counts.
+        //
+        //     TODO: Fix JS hash58 key derivation to match libgpod, OR expose
+        //     libgpod's hash computation via WASM so we can re-sign after mods.
+        {
+            try {
+                const FS = wasm.getModule().FS;
+                const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
+                const dbData = FS.readFile(dbPath);
+
+                // Log final database state (read-only, no modifications)
+                if (dbData.length > 0x20) {
+                    const view = new DataView(dbData.buffer, dbData.byteOffset, dbData.byteLength);
+                    const mhbdHL = view.getUint32(4, true);
+                    const nChildren = view.getUint32(0x14, true);
+                    const scheme = dbData.length > 0x32 ? (dbData[0x30] | (dbData[0x31] << 8)) : 0;
+                    const finalDbId = Array.from(dbData.slice(0x18, 0x20)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    const finalHash58 = Array.from(dbData.slice(0x58, 0x6C)).map(b => b.toString(16).padStart(2, '0')).join('');
+                    log?.(`Final database (libgpod, unmodified): ${dbData.length} bytes, ${nChildren} sections, db_id=0x${finalDbId}, scheme=${scheme}`, 'info');
+                    log?.(`hash58 (libgpod): ${finalHash58}`, 'info');
+                    let p = mhbdHL;
+                    for (let i = 0; i < nChildren && p + 16 <= dbData.length; i++) {
+                        const tag = String.fromCharCode(dbData[p], dbData[p+1], dbData[p+2], dbData[p+3]);
+                        if (tag !== 'mhsd') break;
+                        const sType = view.getUint32(p + 0x0C, true);
+                        const sHL = view.getUint32(p + 4, true);
+                        const sTL = view.getUint32(p + 8, true);
+                        const childP = p + sHL;
+                        let childInfo = '';
+                        if (childP + 12 <= dbData.length) {
+                            const cTag = String.fromCharCode(dbData[childP], dbData[childP+1], dbData[childP+2], dbData[childP+3]);
+                            const cCount = view.getUint32(childP + 8, true);
+                            childInfo = ` → ${cTag}(${cCount})`;
+                        }
+                        log?.(`  mhsd #${i}: type=${sType}, size=${sTL}${childInfo}`, 'info');
+                        p += sTL;
+                    }
+                }
+            } catch (e) {
+                log?.(`Database verification failed: ${e?.message || e}`, 'warning');
             }
         }
 
@@ -634,6 +756,46 @@ export function createSyncPipeline({
                     okLabel: 'OK',
                 });
                 return;
+            }
+
+            // ── Verify: read back iTunesDB from iPod and check track count ──
+            try {
+                const ctrl = await appState.ipodHandle.getDirectoryHandle('iPod_Control', { create: false });
+                const itDir = await ctrl.getDirectoryHandle('iTunes', { create: false });
+                const fh = await itDir.getFileHandle('iTunesDB', { create: false });
+                const readBack = await fh.getFile();
+                const rbData = new Uint8Array(await readBack.arrayBuffer());
+                const rbView = new DataView(rbData.buffer);
+                let rbTrackCount = -1;
+                if (rbData.length > 0x20 && String.fromCharCode(rbData[0], rbData[1], rbData[2], rbData[3]) === 'mhbd') {
+                    const mhbdHL = rbView.getUint32(4, true);
+                    const numCh = rbView.getUint32(0x14, true);  // children at 0x14
+                    let p = mhbdHL;
+                    for (let i = 0; i < numCh && p + 16 <= rbData.length; i++) {
+                        const tag = String.fromCharCode(rbData[p], rbData[p+1], rbData[p+2], rbData[p+3]);
+                        if (tag !== 'mhsd') break;
+                        const sType = rbView.getUint32(p + 0x0C, true);
+                        const sHL = rbView.getUint32(p + 4, true);
+                        const sTL = rbView.getUint32(p + 8, true);
+                        if (sType === 1) {
+                            rbTrackCount = rbView.getUint32(p + sHL + 8, true);
+                        }
+                        p += sTL;
+                    }
+                }
+                const rbDbId = rbData.length >= 0x20 ? Array.from(rbData.slice(0x18, 0x20)).map(b => b.toString(16).padStart(2, '0')).join('') : '?';
+                const rbHash58 = rbData.length >= 0x6C ? Array.from(rbData.slice(0x58, 0x6C)).map(b => b.toString(16).padStart(2, '0')).join('') : '?';
+                log?.(`Read-back: iPod iTunesDB = ${rbData.length} bytes, ${rbTrackCount} tracks, db_id=0x${rbDbId}`, rbTrackCount >= 0 ? 'info' : 'warning');
+                log?.(`Read-back hash58: ${rbHash58}`, 'info');
+
+                // List all files in iPod_Control/iTunes/ on the real iPod
+                const realFiles = [];
+                for await (const [name] of itDir.entries()) {
+                    realFiles.push(name);
+                }
+                log?.(`Files on iPod: ${realFiles.join(', ')}`, 'info');
+            } catch (e) {
+                log?.(`Read-back verification failed: ${e?.message || e}`, 'warning');
             }
 
             const pendingDeletes = appState.pendingFileDeletes || [];
