@@ -6,7 +6,7 @@ import { createContextMenu } from './modules/contextMenu.js';
 import { createFirewireSetup } from './modules/firewireSetup.js';
 import { createModalManager } from './modules/modalManager.js';
 import { createAppState } from './modules/state.js';
-import { readAudioMetadata, getFiletypeFromName, isAudioFile } from './modules/audio.js';
+import { readAudioMetadata, getFiletypeFromName, isAudioFile, isImageFile } from './modules/audio.js';
 import { renderTracks, renderPlaylists, formatDuration, updateConnectionStatus, enableUIIfReady } from './modules/uiRender.js';
 import { createIpodConnectionMonitor } from './modules/ipodConnectionMonitor.js';
 import { createUploadQueue } from './modules/uploadQueue.js';
@@ -352,32 +352,106 @@ async function uploadTracks() {
     try {
         const fileHandles = await window.showOpenFilePicker({
             multiple: true,
-            types: [{
-                description: 'Audio Files',
-                accept: { 'audio/*': ['.mp3', '.m4a', '.aac', '.wav', '.aiff', '.flac'] }
-            }]
+            types: [
+                {
+                    description: 'Audio Files',
+                    accept: { 'audio/*': ['.mp3', '.m4a', '.aac', '.wav', '.aiff', '.flac'] }
+                },
+                {
+                    description: 'Image Files (artwork)',
+                    accept: { 'image/*': ['.jpg', '.jpeg', '.png'] }
+                },
+            ]
         });
 
         if (fileHandles.length === 0) return;
-        uploadQueue.queueFileHandlesForSync(fileHandles);
+
+        // Separate audio and image file handles
+        const audioHandles = [];
+        let artworkFile = null;
+        for (const handle of fileHandles) {
+            if (isImageFile(handle.name)) {
+                if (!artworkFile) artworkFile = await handle.getFile();
+            } else {
+                audioHandles.push(handle);
+            }
+        }
+
+        if (audioHandles.length === 0) return;
+        uploadQueue.queueFileHandlesForSync(audioHandles, {
+            getArtwork: artworkFile ? () => artworkFile : undefined,
+        });
     } catch (e) {
         if (e.name !== 'AbortError') log(`Upload error: ${e.message}`, 'error');
     }
 }
 
-async function collectAudioFilesFromDirectory(dirHandle, collected = [], onProgress = null) {
+const ARTWORK_NAMES_PRIORITY = ['cover', 'folder', 'front'];
+
+function findBestArtwork(imageFiles) {
+    if (imageFiles.length === 0) return null;
+    for (const baseName of ARTWORK_NAMES_PRIORITY) {
+        const match = imageFiles.find(f => {
+            const name = f.name.toLowerCase().replace(/\.[^.]+$/, '');
+            return name === baseName;
+        });
+        if (match) return match;
+    }
+    return imageFiles[0];
+}
+
+function isDiscDirectory(name) {
+    return /^(disc|cd)\s*\d+$/i.test(name);
+}
+
+async function findArtworkInDir(dirHandle) {
+    const imageFiles = [];
+    try {
+        for await (const entry of dirHandle.values()) {
+            if (entry.kind === 'file' && isImageFile(entry.name)) {
+                imageFiles.push(await entry.getFile());
+            }
+        }
+    } catch (_) {}
+    return findBestArtwork(imageFiles);
+}
+
+async function collectAudioFilesFromDirectory(dirHandle, result = { audioFiles: [], artworkByFile: new Map() }, parentDirHandle = null, onProgress = null) {
+    const audioFiles = [];
+    const imageFiles = [];
+
     for await (const entry of dirHandle.values()) {
         if (entry.kind === 'file') {
             if (isAudioFile(entry.name)) {
                 const file = await entry.getFile();
-                collected.push(file);
-                onProgress?.(collected.length);
+                audioFiles.push(file);
+                result.audioFiles.push(file);
+                onProgress?.(result.audioFiles.length);
+            } else if (isImageFile(entry.name)) {
+                imageFiles.push(await entry.getFile());
             }
         } else if (entry.kind === 'directory') {
-            await collectAudioFilesFromDirectory(entry, collected, onProgress);
+            await collectAudioFilesFromDirectory(entry, result, dirHandle, onProgress);
         }
     }
-    return collected;
+
+    // Find best artwork for this directory
+    let artwork = findBestArtwork(imageFiles);
+
+    // Disc-folder fallback: if no artwork found and this is a Disc/CD directory,
+    // look for artwork in the parent directory
+    if (!artwork && parentDirHandle && isDiscDirectory(dirHandle.name)) {
+        artwork = await findArtworkInDir(parentDirHandle);
+    }
+
+    // Map each audio file from this directory to the artwork
+    if (artwork) {
+        for (const file of audioFiles) {
+            result.artworkByFile.set(file, artwork);
+        }
+    }
+
+    return result;
 }
 
 async function uploadFolder() {
@@ -392,20 +466,23 @@ async function uploadFolder() {
         if (saveBtn) saveBtn.disabled = true;
         if (dropZoneText) dropZoneText.textContent = 'Scanning folder... Found 0 files';
 
-        const fileHandles = await collectAudioFilesFromDirectory(dirHandle, [], (count) => {
+        const result = await collectAudioFilesFromDirectory(dirHandle, undefined, null, (count) => {
             if (dropZoneText) dropZoneText.textContent = `Scanning folder... Found ${count} files`;
         });
 
         if (dropZoneText) dropZoneText.textContent = originalDropText;
         if (saveBtn && appState.isConnected && appState.wasmReady) saveBtn.disabled = false;
 
-        if (fileHandles.length === 0) {
+        if (result.audioFiles.length === 0) {
             log('No audio files found in the selected folder', 'warning');
             return;
         }
 
-        log(`Found ${fileHandles.length} audio file(s)`, 'success');
-        uploadQueue.queueFilesForSync(fileHandles);
+        log(`Found ${result.audioFiles.length} audio file(s)`, 'success');
+        const artworkMap = result.artworkByFile;
+        uploadQueue.queueFilesForSync(result.audioFiles, {
+            getArtwork: artworkMap.size > 0 ? (file) => artworkMap.get(file) || null : undefined,
+        });
     } catch (e) {
         if (dropZoneText) dropZoneText.textContent = originalDropText;
         if (saveBtn && appState.isConnected && appState.wasmReady) saveBtn.disabled = false;
@@ -476,17 +553,22 @@ function initDragAndDrop() {
             return;
         }
 
-        const files = Array.from(e.dataTransfer.items)
+        const allFiles = Array.from(e.dataTransfer.items)
             .filter(item => item.kind === 'file')
             .map(item => item.getAsFile())
-            .filter(file => file && isAudioFile(file.name));
+            .filter(Boolean);
 
-        if (files.length === 0) {
+        const audioFiles = allFiles.filter(f => isAudioFile(f.name));
+        const artworkFile = allFiles.find(f => isImageFile(f.name)) || null;
+
+        if (audioFiles.length === 0) {
             log('No audio files found in drop', 'warning');
             return;
         }
 
-        uploadQueue.queueFilesForSync(files);
+        uploadQueue.queueFilesForSync(audioFiles, {
+            getArtwork: artworkFile ? () => artworkFile : undefined,
+        });
     });
 }
 

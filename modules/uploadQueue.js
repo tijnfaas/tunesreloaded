@@ -67,15 +67,19 @@ export function createUploadQueue({
         return computed;
     }
 
-    function queueUploads({ kind, items, getFileForTags }) {
-        const queued = (items || []).map((value) => ({
-            kind,
-            handle: kind === 'handle' ? value : undefined,
-            file: kind === 'file' ? value : undefined,
-            name: value?.name || 'Unknown',
-            status: 'queued',
-            meta: null,
-        }));
+    function queueUploads({ kind, items, getFileForTags, getArtwork }) {
+        const queued = (items || []).map((value) => {
+            const file = kind === 'file' ? value : undefined;
+            return {
+                kind,
+                handle: kind === 'handle' ? value : undefined,
+                file,
+                name: value?.name || 'Unknown',
+                status: 'queued',
+                meta: null,
+                artworkFile: getArtwork?.(value) || null,
+            };
+        });
 
         appendPendingUploads(queued);
 
@@ -84,19 +88,21 @@ export function createUploadQueue({
         }
     }
 
-    function queueFileHandlesForSync(fileHandles) {
+    function queueFileHandlesForSync(fileHandles, { getArtwork } = {}) {
         queueUploads({
             kind: 'handle',
             items: fileHandles,
             getFileForTags: (item) => item.handle.getFile(),
+            getArtwork,
         });
     }
 
-    function queueFilesForSync(files) {
+    function queueFilesForSync(files, { getArtwork } = {}) {
         queueUploads({
             kind: 'file',
             items: files,
             getFileForTags: (item) => item.file,
+            getArtwork,
         });
     }
 

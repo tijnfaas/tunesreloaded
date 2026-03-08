@@ -555,6 +555,69 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
         }
     }
 
+    /**
+     * Write ArtworkDB + .ithmb files to the iPod's Artwork directory.
+     * @param {FileSystemDirectoryHandle} ipodHandle
+     * @param {Uint8Array} artworkDb — ArtworkDB binary
+     * @param {Map<string, Uint8Array>} ithmbs — filename → pixel data
+     */
+    async function writeArtworkFiles(ipodHandle, artworkDb, ithmbs) {
+        if (!ipodHandle) throw new Error('No iPod handle');
+
+        const controlDir = await ipodHandle.getDirectoryHandle('iPod_Control', { create: true });
+        const artDir = await controlDir.getDirectoryHandle('Artwork', { create: true });
+
+        // Write ArtworkDB
+        const dbHandle = await artDir.getFileHandle('ArtworkDB', { create: true });
+        const dbWritable = await dbHandle.createWritable();
+        await dbWritable.write(artworkDb);
+        await dbWritable.close();
+        log?.(`Wrote ArtworkDB (${artworkDb.length} bytes)`, 'info');
+
+        // Write .ithmb files
+        for (const [filename, data] of ithmbs) {
+            const fh = await artDir.getFileHandle(filename, { create: true });
+            const w = await fh.createWritable();
+            await w.write(data);
+            await w.close();
+            log?.(`Wrote ${filename} (${data.length} bytes)`, 'info');
+        }
+    }
+
+    /**
+     * Scan iPod_Control/Artwork/ for existing .ithmb files.
+     * Returns array of format IDs found (e.g. [1055, 1060]).
+     */
+    async function scanExistingIthmbs(ipodHandle) {
+        if (!ipodHandle) return [];
+        try {
+            const ctrl = await ipodHandle.getDirectoryHandle('iPod_Control', { create: false });
+            const artDir = await ctrl.getDirectoryHandle('Artwork', { create: false });
+            const formatIds = [];
+            for await (const [name] of artDir.entries()) {
+                const m = name.match(/^F(\d+)_\d+\.ithmb$/i);
+                if (m) formatIds.push(parseInt(m[1], 10));
+            }
+            return [...new Set(formatIds)].sort((a, b) => a - b);
+        } catch (_) {
+            return [];
+        }
+    }
+
+    /**
+     * Read the SysInfoExtended plist from MEMFS (if available).
+     * Returns the XML string or null.
+     */
+    function readSysInfoExtendedFromVFS() {
+        const FS = getFS();
+        if (!FS) return null;
+        try {
+            return FS.readFile(`${mountpoint}/iPod_Control/Device/SysInfoExtended`, { encoding: 'utf8' });
+        } catch (_) {
+            return null;
+        }
+    }
+
     return {
         mountpoint,
         verifyIpodStructure,
@@ -564,6 +627,9 @@ export function createFsSync({ log, wasm, mountpoint = '/iPod' }) {
         reserveVirtualPath,
         deleteFileFromIpodRelativePath,
         reSignDatabaseFiles,
+        writeArtworkFiles,
+        readSysInfoExtendedFromVFS,
+        scanExistingIthmbs,
     };
 }
 

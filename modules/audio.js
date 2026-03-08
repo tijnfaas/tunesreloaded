@@ -19,6 +19,11 @@ export function isAudioFile(filename) {
     return ['mp3', 'm4a', 'aac', 'wav', 'aiff', 'flac'].includes(ext);
 }
 
+export function isImageFile(filename) {
+    const ext = String(filename || '').toLowerCase().split('.').pop();
+    return ['jpg', 'jpeg', 'png'].includes(ext);
+}
+
 function fallbackTagsFromFilename(file) {
     const title = file.name.replace(/\.[^/.]+$/, '');
     const match = title.match(/^(.+?)\s*-\s*(.+)$/);
@@ -60,14 +65,14 @@ async function getDurationViaHtmlAudioMetadata(file) {
     });
 }
 
-export async function readAudioMetadata(file) {
+export async function readAudioMetadata(file, { extractCovers = false } = {}) {
     // IMPORTANT: Never return NaN/Infinity here.
     // Emscripten coerces NaN/Infinity to 0 for int args, producing 0:00 durations on-device.
     const DEFAULT_PROPS = { duration: 180000, bitrate: 192, samplerate: 44100 }; // 3:00 fallback
 
     try {
         // duration=false avoids full-file scans unless the parser can infer duration from headers.
-        const metadata = await parseBlob(file, { skipCovers: true, skipPostHeaders: true, duration: false });
+        const metadata = await parseBlob(file, { skipCovers: !extractCovers, skipPostHeaders: !extractCovers, duration: false });
 
         const c = metadata?.common || {};
         const fmt = metadata?.format || {};
@@ -109,7 +114,13 @@ export async function readAudioMetadata(file) {
 
         const samplerate = Number.isFinite(fmt.sampleRate) && fmt.sampleRate > 0 ? fmt.sampleRate : DEFAULT_PROPS.samplerate;
 
-        return { tags, props: { duration, bitrate, samplerate } };
+        let artwork = null;
+        if (extractCovers && metadata?.common?.picture?.length > 0) {
+            const pic = metadata.common.picture[0];
+            artwork = pic.data instanceof Uint8Array ? pic.data : new Uint8Array(pic.data);
+        }
+
+        return { tags, props: { duration, bitrate, samplerate }, artwork };
     } catch (_) {
         // Fallback: filename tags + (optional) HTML duration + average bitrate
         const tags = fallbackTagsFromFilename(file);
@@ -121,7 +132,7 @@ export async function readAudioMetadata(file) {
             ? Math.floor((file.size * 8) / durationSec / 1000)
             : null;
         const bitrate = Number.isFinite(avgKbps) && avgKbps > 0 ? avgKbps : DEFAULT_PROPS.bitrate;
-        return { tags, props: { duration, bitrate, samplerate: DEFAULT_PROPS.samplerate } };
+        return { tags, props: { duration, bitrate, samplerate: DEFAULT_PROPS.samplerate }, artwork: null };
     }
 }
 

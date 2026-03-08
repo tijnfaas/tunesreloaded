@@ -139,6 +139,32 @@ export function createWasmApi({ log, createModule = globalThis.createIPodModule 
         );
     }
 
+    function wasmDeviceSupportsArtwork() {
+        return wasmCall('ipod_device_supports_artwork') === 1;
+    }
+
+    function wasmSetTrackArtwork(trackIndex, artworkData) {
+        if (!wasmReady || !Module?.ccall) return -1;
+        const data = artworkData instanceof Uint8Array ? artworkData : new Uint8Array(artworkData);
+        if (data.byteLength === 0) return -1;
+
+        // Use ccall with 'array' type — this uses internal writeArrayToMemory
+        // which has access to HEAPU8 (not exported on Module).
+        // Images should be pre-resized to keep them within the WASM stack limit.
+        const result = Module.ccall(
+            'ipod_track_set_artwork_from_data',
+            'number',
+            ['number', 'array', 'number'],
+            [trackIndex, data, data.byteLength]
+        );
+        if (result !== 0) {
+            const errorPtr = wasmCall('ipod_get_last_error');
+            const error = wasmGetString(errorPtr);
+            log?.(`WASM error (ipod_track_set_artwork_from_data): ${error || 'Unknown error'}`, 'error');
+        }
+        return result;
+    }
+
     return {
         initWasm,
         isReady,
@@ -151,6 +177,8 @@ export function createWasmApi({ log, createModule = globalThis.createIPodModule 
         wasmGetJson,
         wasmCallWithError,
         wasmAddTrack,
+        wasmDeviceSupportsArtwork,
+        wasmSetTrackArtwork,
     };
 }
 
