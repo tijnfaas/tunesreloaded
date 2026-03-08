@@ -372,15 +372,41 @@ export function createSyncPipeline({
             console.warn('[SyncDiag] Could not verify iTunesDB:', e);
         }
 
-        // 2b) Re-sign iTunesCDB + Locations.itdb.cbk with the standalone hashAB WASM
-        //     Only Nano 6th/7th gen use hashAB signing.
-        if (firewireSetup?.needsHashAB?.()) {
-            const fwGuid = firewireSetup.getFirewireGuidHex();
-            if (fwGuid) {
-                try {
-                    await fsSync.reSignDatabaseFiles(fwGuid);
-                } catch (e) {
-                    log?.(`hashAB re-sign failed: ${e?.message || e}`, 'warning');
+        // 2b) Re-sign databases after ipod_write_db().
+        //     libgpod's WASM build may produce incorrect checksums, so we
+        //     always recompute them with our own verified implementations.
+        {
+            // Hash58 (Checksum Type 1) — Nano 3G/4G, Classic 6G/7G
+            // Without correct HMAC-SHA1, the iPod silently rejects the database
+            // and keeps the previous version (causing "ghost" tracks after deletion).
+            try {
+                const FS = wasm.getModule().FS;
+                const dbPath = `${fsSync.mountpoint}/iPod_Control/iTunes/iTunesDB`;
+                const rawData = FS.readFile(dbPath);
+                const dbData = new Uint8Array(rawData.length);
+                dbData.set(rawData);
+                const scheme = dbData.length > 0x32 ? (dbData[0x30] | (dbData[0x31] << 8)) : 0;
+                if (scheme === 1) {
+                    const fwGuid = firewireSetup?.getFirewireGuidHex();
+                    if (fwGuid) {
+                        await recomputeHash58(dbData, parseUUID(fwGuid));
+                        FS.writeFile(dbPath, dbData);
+                        log?.('Recomputed iTunesDB hash58', 'info');
+                    }
+                }
+            } catch (e) {
+                log?.(`hash58 recomputation failed: ${e?.message || e}`, 'warning');
+            }
+
+            // hashAB — Nano 6G/7G (iTunesCDB + Locations.itdb.cbk)
+            if (firewireSetup?.needsHashAB?.()) {
+                const fwGuid = firewireSetup.getFirewireGuidHex();
+                if (fwGuid) {
+                    try {
+                        await fsSync.reSignDatabaseFiles(fwGuid);
+                    } catch (e) {
+                        log?.(`hashAB re-sign failed: ${e?.message || e}`, 'warning');
+                    }
                 }
             }
         }
@@ -526,20 +552,13 @@ export function createSyncPipeline({
 
                             const { patched } = patchITunesDbArtwork(dbData, artworkDbids, formats.length, ithmbSizePerTrack);
                             if (patched > 0) {
-                                // Recompute hash58 if this device uses checksum type 1 (Nano 3G/4G, Classic 6G/7G).
-                                // Our binary patch invalidates the HMAC-SHA1 checksum that ipod_write_db() computed.
+                                // Re-sign after artwork patch (our binary edit invalidated the checksum)
                                 const scheme = dbData[0x30] | (dbData[0x31] << 8);
                                 if (scheme === 1) {
                                     const fwGuid = firewireSetup?.getFirewireGuidHex();
                                     if (fwGuid) {
-                                        try {
-                                            await recomputeHash58(dbData, parseUUID(fwGuid));
-                                            log?.('Recomputed iTunesDB hash58 after artwork patch', 'info');
-                                        } catch (e) {
-                                            log?.(`hash58 recomputation failed: ${e?.message || e}`, 'warning');
-                                        }
-                                    } else {
-                                        log?.('No FirewireGuid available — hash58 not recomputed (database may be rejected by iPod)', 'warning');
+                                        await recomputeHash58(dbData, parseUUID(fwGuid));
+                                        log?.('Re-signed iTunesDB hash58 after artwork patch', 'info');
                                     }
                                 }
 
